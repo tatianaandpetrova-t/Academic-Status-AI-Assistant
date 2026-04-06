@@ -1,0 +1,963 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: ИТМО — ИИ-ассистент для проверки соответствия критериям учёного звания
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: auth
+    description: Аутентификация и регистрация
+  - name: applications
+    description: Заявки на учёное звание
+  - name: criteria
+    description: Критерии учёного звания
+  - name: chat
+    description: ИИ-чат ассистент
+  - name: documents
+    description: Загрузка документов
+  - name: admin
+    description: Административная панель
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  # === AUTH ===
+  /auth/register:
+    post:
+      operationId: registerUser
+      tags: [auth]
+      summary: Регистрация пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Пользователь создан
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Ошибка валидации
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Email уже используется
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/login:
+    post:
+      operationId: loginUser
+      tags: [auth]
+      summary: Вход в систему
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Успешный вход
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          description: Неверные данные
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      tags: [auth]
+      summary: Получить текущего пользователя
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Текущий пользователь
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          description: Не авторизован
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # === CRITERIA ===
+  /criteria:
+    get:
+      operationId: getCriteria
+      tags: [criteria]
+      summary: Получить актуальные критерии
+      parameters:
+        - in: query
+          name: rankType
+          schema:
+            type: string
+            enum: [docent, professor]
+      responses:
+        "200":
+          description: Список критериев
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/CriteriaRule"
+
+    post:
+      operationId: createCriteria
+      tags: [criteria]
+      summary: Создать критерии (только admin)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCriteriaRequest"
+      responses:
+        "201":
+          description: Критерии созданы
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CriteriaRule"
+
+  /criteria/{id}:
+    put:
+      operationId: updateCriteria
+      tags: [criteria]
+      summary: Обновить критерии (только admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCriteriaRequest"
+      responses:
+        "200":
+          description: Критерии обновлены
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CriteriaRule"
+
+  # === APPLICATIONS ===
+  /applications:
+    get:
+      operationId: getApplications
+      tags: [applications]
+      summary: Список заявок пользователя
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [pending, approved, rejected, partial]
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 20
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Список заявок
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicationListResponse"
+
+    post:
+      operationId: createApplication
+      tags: [applications]
+      summary: Создать и проверить заявку
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApplicationRequest"
+      responses:
+        "201":
+          description: Заявка создана с результатом проверки
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Application"
+
+  /applications/{id}:
+    get:
+      operationId: getApplication
+      tags: [applications]
+      summary: Получить заявку по ID
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Заявка
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Application"
+        "404":
+          description: Не найдена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # === CHAT ===
+  /chat/messages:
+    get:
+      operationId: getChatHistory
+      tags: [chat]
+      summary: История чата пользователя
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: История сообщений
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ChatMessage"
+
+    post:
+      operationId: sendChatMessage
+      tags: [chat]
+      summary: Отправить вопрос ИИ-ассистенту
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendChatMessageRequest"
+      responses:
+        "200":
+          description: Ответ ИИ
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatMessage"
+
+  /chat/messages/{id}/rate:
+    post:
+      operationId: rateChatMessage
+      tags: [chat]
+      summary: Оценить ответ ИИ
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RateMessageRequest"
+      responses:
+        "200":
+          description: Оценка сохранена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatMessage"
+
+  # === DOCUMENTS ===
+  /documents:
+    get:
+      operationId: getDocuments
+      tags: [documents]
+      summary: Список документов пользователя
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: applicationId
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Список документов
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Document"
+
+  # === ADMIN ===
+  /admin/users:
+    get:
+      operationId: adminGetUsers
+      tags: [admin]
+      summary: Список всех пользователей (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: role
+          schema:
+            type: string
+            enum: [applicant, expert, admin]
+        - in: query
+          name: isActive
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Список пользователей
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/User"
+
+  /admin/users/{id}/role:
+    put:
+      operationId: adminUpdateUserRole
+      tags: [admin]
+      summary: Изменить роль пользователя (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateUserRoleRequest"
+      responses:
+        "200":
+          description: Роль обновлена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+
+  /admin/applications:
+    get:
+      operationId: adminGetApplications
+      tags: [admin]
+      summary: Все заявки (admin/expert)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+        - in: query
+          name: rankType
+          schema:
+            type: string
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Список заявок
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApplicationListResponse"
+
+  /admin/applications/{id}/review:
+    post:
+      operationId: adminReviewApplication
+      tags: [admin]
+      summary: Проверить заявку вручную (expert/admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewApplicationRequest"
+      responses:
+        "200":
+          description: Заявка проверена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Application"
+
+  /admin/stats:
+    get:
+      operationId: adminGetStats
+      tags: [admin]
+      summary: Статистика (admin)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Статистика
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminStats"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+
+    # === AUTH SCHEMAS ===
+    RegisterRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 6
+        fullName:
+          type: string
+        department:
+          type: string
+        position:
+          type: string
+      required:
+        - email
+        - password
+        - fullName
+
+    LoginRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+      required:
+        - email
+        - password
+
+    AuthResponse:
+      type: object
+      properties:
+        token:
+          type: string
+        user:
+          $ref: "#/components/schemas/User"
+      required:
+        - token
+        - user
+
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+        email:
+          type: string
+        fullName:
+          type: string
+        department:
+          type: string
+        position:
+          type: string
+        role:
+          type: string
+          enum: [applicant, expert, admin]
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - email
+        - fullName
+        - role
+        - isActive
+        - createdAt
+
+    # === CRITERIA SCHEMAS ===
+    CriteriaRule:
+      type: object
+      properties:
+        id:
+          type: integer
+        rankType:
+          type: string
+          enum: [docent, professor]
+        version:
+          type: integer
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        rules:
+          $ref: "#/components/schemas/CriteriaRules"
+      required:
+        - id
+        - rankType
+        - version
+        - isActive
+        - createdAt
+        - rules
+
+    CriteriaRules:
+      type: object
+      properties:
+        academicExperienceYears:
+          type: integer
+          description: Стаж научно-педагогической работы (лет)
+        pedagogicalExperienceYears:
+          type: integer
+          description: Стаж педагогической работы по специальности (лет)
+        publicationsCount:
+          type: integer
+          description: Публикации в рецензируемых изданиях за 5 лет
+        textbooksCount:
+          type: integer
+          description: Учебные издания
+        scopusWosCount:
+          type: integer
+          description: Публикации в Scopus/WoS
+        requiredDegree:
+          type: string
+          description: Требуемая учёная степень (candidate/doctor)
+        graduatesCount:
+          type: integer
+          description: Подготовленные аспиранты (для профессора)
+          nullable: true
+      required:
+        - academicExperienceYears
+        - pedagogicalExperienceYears
+        - publicationsCount
+        - textbooksCount
+        - scopusWosCount
+        - requiredDegree
+
+    CreateCriteriaRequest:
+      type: object
+      properties:
+        rankType:
+          type: string
+          enum: [docent, professor]
+        rules:
+          $ref: "#/components/schemas/CriteriaRules"
+      required:
+        - rankType
+        - rules
+
+    # === APPLICATION SCHEMAS ===
+    ApplicantData:
+      type: object
+      properties:
+        rankType:
+          type: string
+          enum: [docent, professor]
+        academicExperienceYears:
+          type: number
+          description: Стаж научно-педагогической работы
+        pedagogicalExperienceYears:
+          type: number
+          description: Стаж педагогической работы по специальности
+        publicationsCount:
+          type: integer
+          description: Публикации в рецензируемых изданиях за 5 лет
+        textbooksCount:
+          type: integer
+          description: Учебные издания
+        scopusWosCount:
+          type: integer
+          description: Публикации в Scopus/WoS
+        degree:
+          type: string
+          enum: [none, candidate, doctor]
+          description: Учёная степень
+        graduatesCount:
+          type: integer
+          description: Подготовленные аспиранты
+          nullable: true
+        department:
+          type: string
+          nullable: true
+        position:
+          type: string
+          nullable: true
+      required:
+        - rankType
+        - academicExperienceYears
+        - pedagogicalExperienceYears
+        - publicationsCount
+        - textbooksCount
+        - scopusWosCount
+        - degree
+
+    CriterionResult:
+      type: object
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+        required:
+          type: number
+        actual:
+          type: number
+        met:
+          type: boolean
+        shortage:
+          type: number
+          nullable: true
+      required:
+        - name
+        - label
+        - required
+        - actual
+        - met
+
+    CheckResult:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [approved, partial, rejected]
+        score:
+          type: number
+        criteriaBreakdown:
+          type: array
+          items:
+            $ref: "#/components/schemas/CriterionResult"
+        recommendations:
+          type: array
+          items:
+            type: string
+        missingDocuments:
+          type: array
+          items:
+            type: string
+      required:
+        - status
+        - score
+        - criteriaBreakdown
+        - recommendations
+        - missingDocuments
+
+    Application:
+      type: object
+      properties:
+        id:
+          type: integer
+        userId:
+          type: integer
+        rankType:
+          type: string
+          enum: [docent, professor]
+        status:
+          type: string
+          enum: [pending, approved, partial, rejected]
+        structuredData:
+          $ref: "#/components/schemas/ApplicantData"
+        result:
+          $ref: "#/components/schemas/CheckResult"
+        expertComment:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        user:
+          $ref: "#/components/schemas/User"
+          nullable: true
+      required:
+        - id
+        - userId
+        - rankType
+        - status
+        - structuredData
+        - result
+        - createdAt
+        - updatedAt
+
+    CreateApplicationRequest:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/ApplicantData"
+      required:
+        - data
+
+    ApplicationListResponse:
+      type: object
+      properties:
+        applications:
+          type: array
+          items:
+            $ref: "#/components/schemas/Application"
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+      required:
+        - applications
+        - total
+        - limit
+        - offset
+
+    # === CHAT SCHEMAS ===
+    ChatMessage:
+      type: object
+      properties:
+        id:
+          type: integer
+        userId:
+          type: integer
+        message:
+          type: string
+        response:
+          type: string
+        contextAppId:
+          type: integer
+          nullable: true
+        rating:
+          type: integer
+          nullable: true
+          description: 1 = полезно, -1 = не полезно
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - userId
+        - message
+        - response
+        - createdAt
+
+    SendChatMessageRequest:
+      type: object
+      properties:
+        message:
+          type: string
+          minLength: 1
+        contextAppId:
+          type: integer
+          nullable: true
+      required:
+        - message
+
+    RateMessageRequest:
+      type: object
+      properties:
+        rating:
+          type: integer
+          enum: [1, -1]
+      required:
+        - rating
+
+    # === DOCUMENT SCHEMAS ===
+    Document:
+      type: object
+      properties:
+        id:
+          type: integer
+        applicationId:
+          type: integer
+          nullable: true
+        fileName:
+          type: string
+        fileUrl:
+          type: string
+        fileType:
+          type: string
+        uploadedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - fileName
+        - fileUrl
+        - fileType
+        - uploadedAt
+
+    # === ADMIN SCHEMAS ===
+    UpdateUserRoleRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [applicant, expert, admin]
+        isActive:
+          type: boolean
+      required:
+        - role
+
+    ReviewApplicationRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [approved, rejected, partial]
+        expertComment:
+          type: string
+      required:
+        - status
+
+    AdminStats:
+      type: object
+      properties:
+        totalApplications:
+          type: integer
+        approvedCount:
+          type: integer
+        rejectedCount:
+          type: integer
+        partialCount:
+          type: integer
+        pendingCount:
+          type: integer
+        totalUsers:
+          type: integer
+        totalChatMessages:
+          type: integer
+        recentApplications:
+          type: array
+          items:
+            $ref: "#/components/schemas/Application"
+        applicationsByDay:
+          type: array
+          items:
+            $ref: "#/components/schemas/DailyCount"
+      required:
+        - totalApplications
+        - approvedCount
+        - rejectedCount
+        - partialCount
+        - pendingCount
+        - totalUsers
+        - totalChatMessages
+        - recentApplications
+        - applicationsByDay
+
+    DailyCount:
+      type: object
+      properties:
+        date:
+          type: string
+        count:
+          type: integer
+      required:
+        - date
+        - count
