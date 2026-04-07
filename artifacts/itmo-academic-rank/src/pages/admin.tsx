@@ -467,6 +467,8 @@ function DocumentsTab() {
   const [editingContent, setEditingContent] = useState<number | null>(null);
   const [contentValue, setContentValue] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [debugIndexing, setDebugIndexing] = useState(false);
+  const [indexingByDocId, setIndexingByDocId] = useState<Record<number, any>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // При выборе файла сохраняем его и подставляем имя в название
@@ -485,7 +487,10 @@ function DocumentsTab() {
   // Загрузка файла по кнопке
   const handleUpload = async () => {
     if (!selectedFile || !title.trim()) return;
-    await uploadMutation.mutateAsync({ file: selectedFile, title, description });
+    const result = await uploadMutation.mutateAsync({ file: selectedFile, title, description });
+    if (result?.id && result?.indexing) {
+      setIndexingByDocId((prev) => ({ ...prev, [result.id]: result.indexing }));
+    }
     // Сбрасываем после успешной загрузки
     setSelectedFile(null);
     setTitle('');
@@ -503,7 +508,10 @@ function DocumentsTab() {
   };
 
   const handleSaveContent = async (id: number) => {
-    await updateMutation.mutateAsync({ id, content: contentValue });
+    const result = await updateMutation.mutateAsync({ id, content: contentValue });
+    if (result?.indexing) {
+      setIndexingByDocId((prev) => ({ ...prev, [id]: result.indexing }));
+    }
     setEditingContent(null);
   };
 
@@ -512,8 +520,7 @@ function DocumentsTab() {
       <Card className="p-5">
         <h3 className="font-bold text-lg mb-1">Загрузить нормативный документ</h3>
         <p className="text-sm text-slate-500 mb-4">
-          Документы с текстовым содержимым (TXT, MD) автоматически индексируются для ИИ-ассистента.
-          Для PDF и DOCX введите текст вручную после загрузки.
+          Поддерживаются форматы PDF, DOCX, TXT, MD. После загрузки текст автоматически индексируется для ИИ-ассистента.
         </p>
         <div className="grid sm:grid-cols-2 gap-4 mb-4">
           <div className="space-y-1.5">
@@ -538,7 +545,7 @@ function DocumentsTab() {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".pdf,.doc,.docx,.txt,.md"
+              accept=".pdf,.docx,.txt,.md"
               onChange={handleFileSelect}
               className="hidden"
               id="rag-file-upload"
@@ -577,6 +584,14 @@ function DocumentsTab() {
               </button>
             )}
           </div>
+          <label className="flex items-center gap-2 text-sm text-slate-600">
+            <input
+              type="checkbox"
+              checked={debugIndexing}
+              onChange={(e) => setDebugIndexing(e.target.checked)}
+            />
+            Показать отладку индексации (embedding-провайдер, статистика чанков)
+          </label>
         </div>
       </Card>
 
@@ -611,6 +626,11 @@ function DocumentsTab() {
                       <Badge variant="default" className="text-xs bg-green-100 text-green-700">✓ Текст готов</Badge>
                     ) : (
                       <Badge variant="warning" className="text-xs">Нет текста</Badge>
+                    )}
+                    {debugIndexing && indexingByDocId[doc.id]?.providers && (
+                      <Badge variant="outline" className="text-xs">
+                        embedding: {Object.entries(indexingByDocId[doc.id].providers).sort((a: any, b: any) => (b[1] as number) - (a[1] as number))[0]?.[0] || "unknown"}
+                      </Badge>
                     )}
                   </div>
                   {doc.description && <p className="text-sm text-slate-500 mt-0.5">{doc.description}</p>}
@@ -667,6 +687,26 @@ function DocumentsTab() {
                       <X className="w-4 h-4 mr-1.5" /> Отмена
                     </Button>
                     <span className="text-xs text-slate-400 self-center ml-2">{contentValue.length.toLocaleString()} символов</span>
+                  </div>
+                </div>
+              )}
+              {debugIndexing && indexingByDocId[doc.id] && (
+                <div className="mt-4 pt-4 border-t border-slate-100 text-xs text-slate-600 space-y-1">
+                  <div>
+                    Индексация: чанков {indexingByDocId[doc.id].insertedChunks}/{indexingByDocId[doc.id].totalChunks}
+                    {typeof indexingByDocId[doc.id].rawChunks === "number" ? ` (всего найдено ${indexingByDocId[doc.id].rawChunks})` : ""}
+                  </div>
+                  {indexingByDocId[doc.id].truncated && (
+                    <div className="text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1 inline-block">
+                      Внимание: индекс обрезан по лимиту чанков
+                    </div>
+                  )}
+                  <div className="flex gap-3 flex-wrap">
+                    {Object.entries(indexingByDocId[doc.id].providers || {}).map(([provider, count]) => (
+                      <span key={provider} className="px-2 py-0.5 rounded bg-slate-100">
+                        {provider}: {String(count)}
+                      </span>
+                    ))}
                   </div>
                 </div>
               )}

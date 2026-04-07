@@ -119,7 +119,15 @@ export function useRagDocuments() {
 export function useUploadRagDocument() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ file, title, description }: { file: File; title: string; description?: string }) => {
+    mutationFn: async ({
+      file,
+      title,
+      description,
+    }: {
+      file: File;
+      title: string;
+      description?: string;
+    }) => {
       const formData = new FormData();
       formData.append('file', file);
       formData.append('title', title);
@@ -145,7 +153,19 @@ export function useUploadRagDocument() {
 export function useUpdateRagDocument() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ id, content, title, description, isActive }: { id: number; content?: string; title?: string; description?: string; isActive?: boolean }) => {
+    mutationFn: async ({
+      id,
+      content,
+      title,
+      description,
+      isActive,
+    }: {
+      id: number;
+      content?: string;
+      title?: string;
+      description?: string;
+      isActive?: boolean;
+    }) => {
       const res = await fetch(`/api/admin/rag-documents/${id}/content`, {
         method: 'PUT',
         headers: authHeaders(),

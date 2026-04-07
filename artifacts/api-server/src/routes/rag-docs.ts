@@ -9,13 +9,14 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { requireAuth, requireRole } from "../middlewares/auth.js";
 import { PDFParse } from "pdf-parse";
+import mammoth from "mammoth";
 import { chunkText } from "../lib/rag";
-import { generateEmbedding } from "../lib/embeddings";
+import { generateEmbeddingDetailed, type EmbeddingProvider } from "../lib/embeddings";
 
 const router: IRouter = Router();
 const DEFAULT_MAX_CONTENT_CHARS = 200_000;
 const HARD_MAX_CONTENT_CHARS = 1_000_000;
-const DEFAULT_MAX_CHUNKS = 40;
+const DEFAULT_MAX_CHUNKS = 200;
 
 function getMaxContentChars(): number {
   const raw = process.env.RAG_MAX_CONTENT_CHARS;
@@ -65,12 +66,12 @@ const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = [".pdf", ".doc", ".docx", ".txt", ".md"];
+    const allowed = [".pdf", ".docx", ".txt", ".md"];
     const ext = path.extname(file.originalname).toLowerCase();
     if (allowed.includes(ext)) {
       cb(null, true);
     } else {
-      cb(new Error("Разрешены только PDF, DOC, DOCX, TXT, MD файлы"));
+      cb(new Error("Разрешены только PDF, DOCX, TXT, MD файлы"));
     }
   },
 });
@@ -120,6 +121,12 @@ async function extractTextFromFile(filePath: string, _mimeType: string): Promise
       return (data.text ?? "").slice(0, maxChars);
     }
 
+    if (ext === ".docx") {
+      const result = await mammoth.extractRawText({ path: filePath });
+      return (result.value ?? "").slice(0, maxChars);
+    }
+
+    // .doc бинарный формат не поддерживаем надёжно без внешних утилит.
     return "";
   } catch (e) {
     console.error("[rag] extractTextFromFile failed", {
@@ -129,6 +136,57 @@ async function extractTextFromFile(filePath: string, _mimeType: string): Promise
     });
     return "";
   }
+}
+
+async function rebuildDocumentChunks(
+  documentId: number,
+  content: string,
+  req: any,
+): Promise<{
+  insertedChunks: number;
+  providers: Record<EmbeddingProvider, number>;
+  totalChunks: number;
+  rawChunks: number;
+  truncated: boolean;
+}> {
+  await db.delete(ragDocumentChunksTable).where(eq(ragDocumentChunksTable.documentId, documentId));
+
+  const rawChunks = chunkText(content, { chunkSize: 1200, overlap: 250 });
+  const maxChunks = getMaxChunks();
+  const chunks = rawChunks.slice(0, maxChunks);
+  let insertedChunks = 0;
+  const providers: Record<EmbeddingProvider, number> = {
+    ollama: 0,
+    yandex: 0,
+    hf: 0,
+    deterministic: 0,
+  };
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    try {
+      const { embedding, provider } = await generateEmbeddingDetailed(chunk);
+      await db.insert(ragDocumentChunksTable).values({
+        documentId,
+        chunkIndex: i,
+        chunkText: chunk,
+        embedding,
+        isActive: true,
+      });
+      providers[provider] += 1;
+      insertedChunks += 1;
+    } catch (e) {
+      req.log.warn({ err: e, chunkIndex: i, documentId }, "Failed to generate/insert embeddings for chunk");
+    }
+  }
+
+  return {
+    insertedChunks,
+    providers,
+    totalChunks: chunks.length,
+    rawChunks: rawChunks.length,
+    truncated: rawChunks.length > maxChunks,
+  };
 }
 
 // Получить список нормативных документов (только admin)
@@ -198,6 +256,20 @@ router.post("/admin/rag-documents/upload", requireAuth, requireRole("admin"), up
     const fileUrl = `/api/admin/rag-documents/file/${req.file.filename}`;
     const content = await extractTextFromFile(req.file.path, req.file.mimetype);
 
+    if (!content || content.trim().length < 50) {
+      res.status(400).json({
+        error:
+          "Не удалось извлечь текст из файла. Поддерживаются PDF/TXT/MD/DOCX (для .doc сначала сохраните как .docx).",
+      });
+      return;
+    }
+
+    const chunks = chunkText(content, { chunkSize: 1200, overlap: 250 }).slice(0, getMaxChunks());
+    if (chunks.length === 0) {
+      res.status(400).json({ error: "После обработки документ не содержит пригодных фрагментов для RAG" });
+      return;
+    }
+
     const [doc] = await db.insert(ragDocumentsTable).values({
       title: title.trim(),
       description: description?.trim() || null,
@@ -209,24 +281,12 @@ router.post("/admin/rag-documents/upload", requireAuth, requireRole("admin"), up
       uploadedBy: req.userId,
     }).returning();
 
-    if (content && content.trim().length > 0) {
-      const chunks = chunkText(content, { chunkSize: 800, overlap: 200 }).slice(0, getMaxChunks());
+    const indexing = await rebuildDocumentChunks(doc.id, content, req);
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        try {
-          const embedding = await generateEmbedding(chunk);
-          await db.insert(ragDocumentChunksTable).values({
-            documentId: doc.id,
-            chunkIndex: i,
-            chunkText: chunk,
-            embedding,
-            isActive: true,
-          });
-        } catch (e) {
-          req.log.warn({ err: e, chunkIndex: i }, "Failed to generate/insert embeddings for chunk");
-        }
-      }
+    if (indexing.insertedChunks === 0) {
+      await db.delete(ragDocumentsTable).where(eq(ragDocumentsTable.id, doc.id));
+      res.status(500).json({ error: "Не удалось построить индекс документа (эмбеддинги не создались)" });
+      return;
     }
 
     res.status(201).json({
@@ -240,6 +300,7 @@ router.post("/admin/rag-documents/upload", requireAuth, requireRole("admin"), up
       contentLength: doc.content?.length || 0,
       isActive: doc.isActive,
       uploadedAt: doc.uploadedAt,
+      indexing,
     });
   } catch (err) {
     req.log.error({ err }, "Ошибка загрузки RAG документа");
@@ -272,25 +333,13 @@ router.put("/admin/rag-documents/:id/content", requireAuth, requireRole("admin")
     if (updates.content !== undefined) {
       const newContent = typeof content === "string" ? content : updated.content;
       if (newContent && newContent.trim().length > 0) {
-        await db.delete(ragDocumentChunksTable).where(eq(ragDocumentChunksTable.documentId, id));
+        const indexing = await rebuildDocumentChunks(id, newContent, req);
 
-        const chunks = chunkText(newContent, { chunkSize: 800, overlap: 200 }).slice(0, getMaxChunks());
-
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i];
-          try {
-            const embedding = await generateEmbedding(chunk);
-            await db.insert(ragDocumentChunksTable).values({
-              documentId: id,
-              chunkIndex: i,
-              chunkText: chunk,
-              embedding,
-              isActive: true,
-            });
-          } catch (e) {
-            req.log.warn({ err: e, chunkIndex: i }, "Failed to re-generate embeddings for chunk");
-          }
+        if (indexing.insertedChunks === 0) {
+          res.status(500).json({ error: "Не удалось переиндексировать документ: эмбеддинги не создались" });
+          return;
         }
+        (updated as any)._indexing = indexing;
       }
     }
 
@@ -306,9 +355,44 @@ router.put("/admin/rag-documents/:id/content", requireAuth, requireRole("admin")
       contentLength: (updated.content ?? "").length,
       isActive: updated.isActive,
       uploadedAt: updated.uploadedAt,
+      indexing: (updated as any)._indexing ?? null,
     });
   } catch (err) {
     req.log.error({ err }, "Ошибка обновления RAG документа");
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Переиндексация всех активных RAG-документов (только admin)
+router.post("/admin/rag-documents/reindex", requireAuth, requireRole("admin"), async (req, res) => {
+  try {
+    const docs = await db.select().from(ragDocumentsTable).where(eq(ragDocumentsTable.isActive, true));
+    let reindexed = 0;
+    const failed: Array<{ id: number; title: string; reason: string }> = [];
+
+    for (const doc of docs) {
+      const content = (doc.content ?? "").trim();
+      if (!content) {
+        failed.push({ id: doc.id, title: doc.title, reason: "empty content" });
+        continue;
+      }
+
+      const indexing = await rebuildDocumentChunks(doc.id, content, req);
+      if (indexing.insertedChunks > 0) {
+        reindexed += 1;
+      } else {
+        failed.push({ id: doc.id, title: doc.title, reason: "no embeddings" });
+      }
+    }
+
+    res.json({
+      success: true,
+      total: docs.length,
+      reindexed,
+      failed,
+    });
+  } catch (err) {
+    req.log.error({ err }, "Ошибка переиндексации RAG документов");
     res.status(500).json({ error: "Ошибка сервера" });
   }
 });

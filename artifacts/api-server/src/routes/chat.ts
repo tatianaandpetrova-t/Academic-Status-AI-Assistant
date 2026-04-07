@@ -75,31 +75,11 @@ ${ragContext}
 }
 
 async function buildSystemPromptWithVectorRag(userMessage: string): Promise<string> {
-  const topK = 12;  // Увеличили с 8 до 12 для лучшего покрытия
-  const similarityThreshold = 0.5;  // Порог релевантности
+  const topK = 12;
+  const similarityThreshold = 0.18;
 
   try {
-    const queryEmbedding = await generateEmbedding(userMessage);
-    if (!queryEmbedding?.length) return buildSystemPromptFallback();
-
-    const similarity = sql<number>`1 - (${cosineDistance(ragDocumentChunksTable.embedding, queryEmbedding)})`;
-
-    const rawChunks = await db
-      .select({
-        chunkText: ragDocumentChunksTable.chunkText,
-        documentTitle: ragDocumentsTable.title,
-        similarity,
-      })
-      .from(ragDocumentChunksTable)
-      .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
-      .where(eq(ragDocumentsTable.isActive, true))
-      .orderBy((t) => desc(t.similarity))
-      .limit(topK * 2);  // Берём больше чтобы отфильтровать по порогу
-
-    // Фильтруем по порогу релевантности
-    const chunks = rawChunks
-      .filter((c) => Number(c.similarity) >= similarityThreshold)
-      .slice(0, topK);
+    const chunks = await selectRagChunks(userMessage, topK * 3);
 
     const validChunks = chunks
       .map((c) => c.chunkText)
@@ -108,11 +88,15 @@ async function buildSystemPromptWithVectorRag(userMessage: string): Promise<stri
     if (validChunks.length === 0) return buildSystemPromptFallback();
 
     const ragContext = chunks
+      .filter((c) => c.score >= similarityThreshold)
+      .slice(0, topK)
       .map(
-        (c) =>
-          `--- ДОКУМЕНТ: ${c.documentTitle} ---\n${c.chunkText.slice(0, 2000)}\n---`,
+        (c, idx) =>
+          `[SOURCE_${idx + 1}] ДОКУМЕНТ: ${c.documentTitle}; ФРАГМЕНТ: ${c.chunkIndex}; SCORE: ${c.score.toFixed(3)}; KEYWORD: ${c.keywordScore.toFixed(3)}; SEMANTIC: ${c.semanticScore.toFixed(3)}\n${c.chunkText.slice(0, 2200)}`,
       )
       .join("\n\n");
+
+    if (!ragContext.trim()) return buildSystemPromptFallback();
 
     return `${BASE_SYSTEM_PROMPT}
 
@@ -122,33 +106,151 @@ async function buildSystemPromptWithVectorRag(userMessage: string): Promise<stri
 ${ragContext}
 
 КРИТИЧЕСКИ ВАЖНО:
-- ОТВЕЧАЙ ТОЛЬКО на основе приведённых выше фрагментов документов
+- СНАЧАЛА используй факты из приведённых фрагментов документов (они приоритетнее любых общих знаний)
 - Если точного ответа нет в предоставленных фрагментах — скажи "В предоставленных документах нет информации по этому вопросу"
 - ЦИТИРУЙ дословно текст документа, не выдумывай и не обобщай
 - Если просит процитировать конкретный пункт — найди и приведи ТОЧНУЮ цитату из документа
+- В конце каждого содержательного утверждения ставь ссылку на источник в формате [SOURCE_N]
 - Не используй общие знания или предположения`;
   } catch {
     return buildSystemPromptFallback();
   }
 }
 
-async function selectRagChunks(userMessage: string, topK = 12) {  // Увеличили default до 12
-  const queryEmbedding = await generateEmbedding(userMessage);
-  const similarity = sql<number>`1 - (${cosineDistance(ragDocumentChunksTable.embedding, queryEmbedding)})`;
+function normalizeTokenForSearch(token: string): string {
+  return token.toLowerCase().replace(/[^a-zа-яё0-9]/gi, "");
+}
 
-  return db
+function extractRequestedPoints(query: string): string[] {
+  const matches = query.match(/(?:пункт|п\.?)\s*(\d{1,3})/gi) ?? [];
+  return matches
+    .map((m) => m.match(/(\d{1,3})/)?.[1] ?? "")
+    .filter(Boolean);
+}
+
+function pointScore(text: string, query: string): number {
+  const points = extractRequestedPoints(query);
+  if (points.length === 0) return 0;
+  const textLc = text.toLowerCase();
+  let hit = 0;
+  for (const p of points) {
+    const patterns = [
+      `пункт ${p}`,
+      `п. ${p}`,
+      `п.${p}`,
+      `${p}.`,
+      `(${p})`,
+    ];
+    if (patterns.some((pt) => textLc.includes(pt))) hit += 1;
+  }
+  return hit / points.length;
+}
+
+function keywordScore(text: string, query: string): number {
+  const textLc = text.toLowerCase();
+  const queryTokens = Array.from(
+    new Set(
+      query
+        .split(/\s+/)
+        .map((t) => normalizeTokenForSearch(t))
+        .filter((t) => t.length >= 3),
+    ),
+  );
+  if (queryTokens.length === 0) return 0;
+
+  let score = 0;
+  for (const token of queryTokens) {
+    if (textLc.includes(token)) score += 1;
+  }
+  return score / queryTokens.length;
+}
+
+async function selectRagChunks(userMessage: string, topK = 12) {
+  const lexicalRaw = await db
     .select({
       documentId: ragDocumentsTable.id,
       documentTitle: ragDocumentsTable.title,
       chunkIndex: ragDocumentChunksTable.chunkIndex,
       chunkText: ragDocumentChunksTable.chunkText,
-      similarity,
     })
     .from(ragDocumentChunksTable)
     .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
     .where(eq(ragDocumentsTable.isActive, true))
-    .orderBy((t) => desc(t.similarity))
-    .limit(topK);
+    .limit(Math.max(topK * 12, 200));
+
+  const lexicalScored = lexicalRaw
+    .map((c) => {
+      const kScore = keywordScore(c.chunkText, userMessage);
+      const pScore = pointScore(c.chunkText, userMessage);
+      const combinedKeyword = kScore * 0.75 + pScore * 0.25;
+      return {
+        ...c,
+        keywordScore: combinedKeyword,
+        semanticScore: 0,
+        similarity: 0,
+        score: combinedKeyword,
+      };
+    })
+    .filter((c) => c.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK * 4);
+
+  let semanticScored: Array<{
+    documentId: number;
+    documentTitle: string;
+    chunkIndex: number;
+    chunkText: string;
+    keywordScore: number;
+    semanticScore: number;
+    similarity: number;
+    score: number;
+  }> = [];
+
+  try {
+    const queryEmbedding = await generateEmbedding(userMessage);
+    const similarity = sql<number>`1 - (${cosineDistance(ragDocumentChunksTable.embedding, queryEmbedding)})`;
+
+    const semanticRaw = await db
+      .select({
+        documentId: ragDocumentsTable.id,
+        documentTitle: ragDocumentsTable.title,
+        chunkIndex: ragDocumentChunksTable.chunkIndex,
+        chunkText: ragDocumentChunksTable.chunkText,
+        similarity,
+      })
+      .from(ragDocumentChunksTable)
+      .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
+      .where(eq(ragDocumentsTable.isActive, true))
+      .orderBy((t) => desc(t.similarity))
+      .limit(topK * 8);
+
+    semanticScored = semanticRaw.map((c) => {
+      const sim = Number(c.similarity);
+      const kScore = keywordScore(c.chunkText, userMessage);
+      const pScore = pointScore(c.chunkText, userMessage);
+      const combinedKeyword = kScore * 0.7 + pScore * 0.3;
+      return {
+        ...c,
+        keywordScore: combinedKeyword,
+        semanticScore: sim,
+        score: sim * 0.75 + combinedKeyword * 0.25,
+      };
+    });
+  } catch {
+    // Важный fallback: RAG остаётся рабочим даже без embedding-провайдера.
+    semanticScored = [];
+  }
+
+  const merged = new Map<string, (typeof lexicalScored)[number]>();
+  for (const c of [...semanticScored, ...lexicalScored]) {
+    const key = `${c.documentId}:${c.chunkIndex}`;
+    const prev = merged.get(key);
+    if (!prev || c.score > prev.score) merged.set(key, c);
+  }
+
+  return Array.from(merged.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK);
 }
 
 // История чата пользователя
