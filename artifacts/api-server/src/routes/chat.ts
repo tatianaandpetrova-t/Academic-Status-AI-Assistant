@@ -272,11 +272,12 @@ async function fullTextSearchChunks(query: string, topK: number) {
 
   if (keywords.length === 0) return [];
 
-  // Используем нечеткий поиск с триграммами
-  // Ищем чанки, которые содержат хотя бы одно из ключевых слов
-  const conditions = keywords.map(keyword => 
-    like(ragDocumentChunksTable.chunkText, `%${keyword}%`)
-  );
+  const conditions: ReturnType<typeof like>[] = [];
+  for (const keyword of keywords) {
+    for (const p of likePatternsForSearchToken(keyword)) {
+      conditions.push(like(ragDocumentChunksTable.chunkText, `%${p}%`));
+    }
+  }
 
   const raw = await db
     .select({
@@ -332,11 +333,15 @@ async function searchByMetadata(query: string, topK: number) {
 
     // Ищем по ключевым словам в заголовке раздела
     for (const keyword of sectionKeywords.slice(0, 5)) {
-      sectionConditions.push(like(ragDocumentChunksTable.sectionTitle, `%${keyword}%`));
+      for (const p of likePatternsForSearchToken(keyword)) {
+        sectionConditions.push(like(ragDocumentChunksTable.sectionTitle, `%${p}%`));
+      }
     }
 
     for (const keyword of sectionKeywords.slice(0, 3)) {
-      sectionConditions.push(like(ragDocumentChunksTable.chunkText, `%${keyword}%`));
+      for (const p of likePatternsForSearchToken(keyword)) {
+        sectionConditions.push(like(ragDocumentChunksTable.chunkText, `%${p}%`));
+      }
     }
 
     if (sectionConditions.length > 0) {
@@ -543,7 +548,7 @@ ${quoteInstructions}`;
 
     // Собираем контекст из отфильтрованных чанков
     const ragContext = sortedChunks
-      .slice(0, 5)
+      .slice(0, 8)
       .map((c) => {
         const displayTitle =
           displayTitleByDocId.get(c.documentId) ?? humanizeRagSlug(c.documentTitle);
@@ -564,7 +569,8 @@ ${quoteInstructions}`;
       : `
 КРИТИЧЕСКИ ВАЖНО:
 - СНАЧАЛА используй факты из приведённых фрагментов документов
-- Если точного ответа нет в предоставленных фрагментах — скажи "В предоставленных документах нет информации по этому вопросу"
+- Если прямого определения нет, но в фрагментах есть связанные требования, сроки или условия (например, про стаж в пунктах о критериях) — кратко собери ответ из этих фрагментов и укажи номера пунктов из текста
+- Фразу «В предоставленных документах нет информации по этому вопросу» используй только если в переданных фрагментах действительно нет материала, относящегося к вопросу (ни прямого, ни косвенного)
 - Цитируй дословно там, где это важно; не выдумывай номера пунктов
 - Для пользователя указывай источник только как «название из пометки», при необходимости пункт/раздел из текста`;
 
@@ -596,10 +602,12 @@ async function buildSystemPromptWithFullDocumentFallback(userMessage: string): P
       return buildSystemPromptFallback();
     }
 
-    // Ищем документы, в тексте которых есть ключевые слова
-    const conditions = keywords.map(keyword => 
-      like(ragDocumentsTable.content, `%${keyword}%`)
-    );
+    const conditions: ReturnType<typeof like>[] = [];
+    for (const keyword of keywords) {
+      for (const p of likePatternsForSearchToken(keyword)) {
+        conditions.push(like(ragDocumentsTable.content, `%${p}%`));
+      }
+    }
 
     const docs = await db
       .select({
@@ -647,6 +655,21 @@ ${ragContext}
 function normalizeTokenForSearch(token: string): string {
   return token.toLowerCase().replace(/[^a-zа-яё0-9]/gi, "");
 }
+
+/**
+ * Варианты подстрок для LIKE по русским словам: точная форма + укороченные префиксы,
+ * чтобы находить «педагогического» при запросе «педагогический» (без морфологического анализатора).
+ */
+function likePatternsForSearchToken(word: string): string[] {
+  const w = word.toLowerCase();
+  if (w.length < 4 || !/[а-яё]/i.test(w)) return [w];
+  const patterns = new Set<string>([w]);
+  if (w.length >= 6) patterns.add(w.slice(0, 6));
+  if (w.length >= 8) patterns.add(w.slice(0, 8));
+  if (w.length >= 10) patterns.add(w.slice(0, 10));
+  return [...patterns].filter((p) => p.length >= 4);
+}
+
 
 /**
  * Извлекает номера пунктов из запроса пользователя
