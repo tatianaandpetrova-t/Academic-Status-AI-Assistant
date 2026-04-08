@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { pgTable, serial, integer, text, timestamp, boolean, vector, index } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod/v4";
@@ -15,7 +16,7 @@ export const ragDocumentChunksTable = pgTable(
     documentId: integer("document_id").notNull().references(() => ragDocumentsTable.id, { onDelete: "cascade" }),
     chunkIndex: integer("chunk_index").notNull(),
     chunkText: text("chunk_text").notNull(),
-    // Полнотекстовый поиск для русского языка (tsvector)
+    // Нормализованный текст для to_tsvector (см. GIN-индекс ниже; не «сырой» tsvector в колонке)
     chunkTextSearch: text("chunk_text_search"),
     // Метаданные для улучшения поиска
     pointNumber: text("point_number"), // Номер пункта (например, "2", "22.1")
@@ -26,8 +27,11 @@ export const ragDocumentChunksTable = pgTable(
   },
   (table) => [
     index("rag_document_chunks_embedding_hnsw").using("hnsw", table.embedding.op("vector_cosine_ops")),
-    // Индекс для полнотекстового поиска
-    index("rag_document_chunks_text_search_gin").using("gin", table.chunkTextSearch),
+    // GIN по выражению: GIN(text) без opclass в PostgreSQL недопустим; совпадает с artifacts/api-server/migrations/003_rag_improvements.sql
+    index("rag_document_chunks_text_search_gin").using(
+      "gin",
+      sql`to_tsvector('russian', ${table.chunkTextSearch})`,
+    ),
   ],
 );
 
