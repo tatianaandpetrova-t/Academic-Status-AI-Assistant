@@ -48,3 +48,7 @@ Thumbs.db
 .cache/
 .local/
 .env 
+"artifacts/api-server/uploads/rag/*.docx" 
+"artifacts/api-server/uploads/rag/*.pdf" 
+"artifacts/api-server/uploads/rag/*.txt" 
+"artifacts/api-server/uploads/rag/*.txt" 

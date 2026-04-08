@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { ragDocumentsTable, ragDocumentChunksTable } from "@workspace/db/schema";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
@@ -10,13 +10,13 @@ import { pathToFileURL } from "node:url";
 import { requireAuth, requireRole } from "../middlewares/auth.js";
 import { PDFParse } from "pdf-parse";
 import mammoth from "mammoth";
-import { chunkText } from "../lib/rag";
+import { chunkTextWithMetadata, searchChunksByPoint } from "../lib/rag";
 import { generateEmbeddingDetailed, type EmbeddingProvider } from "../lib/embeddings";
 
 const router: IRouter = Router();
-const DEFAULT_MAX_CONTENT_CHARS = 200_000;
-const HARD_MAX_CONTENT_CHARS = 1_000_000;
-const DEFAULT_MAX_CHUNKS = 200;
+const DEFAULT_MAX_CONTENT_CHARS = 500_000;  // Увеличено для больших документов
+const HARD_MAX_CONTENT_CHARS = 2_000_000;
+const DEFAULT_MAX_CHUNKS = 1000;  // Увеличено для полного покрытия документа
 
 function getMaxContentChars(): number {
   const raw = process.env.RAG_MAX_CONTENT_CHARS;
@@ -29,7 +29,7 @@ function getMaxChunks(): number {
   const raw = process.env.RAG_MAX_CHUNKS;
   const parsed = raw ? Number(raw) : DEFAULT_MAX_CHUNKS;
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_MAX_CHUNKS;
-  return Math.min(Math.floor(parsed), 200);
+  return Math.min(Math.floor(parsed), 2000);  // Увеличен лимит
 }
 
 // pdf-parse в bundled `dist` может не найти worker по относительному пути,
@@ -118,12 +118,68 @@ async function extractTextFromFile(filePath: string, _mimeType: string): Promise
       const buffer = fs.readFileSync(filePath);
       const parser = new PDFParse({ data: buffer } as any);
       const data = await parser.getText();
-      return (data.text ?? "").slice(0, maxChars);
+      
+      // Обрабатываем извлечённый текст из PDF
+      let text = data.text ?? "";
+      
+      // PDF часто "склеивает" номера пунктов с текстом, например:
+      // "11.Требования к документам" или "11. Требования"
+      // Нужно нормализовать пробелы после номеров пунктов
+      
+      // Нормализация: добавляем пробел после номера пункта если его нет
+      text = text.replace(/(\d+)\.([А-ЯЁA-Z])/g, '$1. $2');
+      
+      // Убираем артефакты извлечения (常见的 PDF encoding issues)
+      text = text.replace(/([а-яА-ЯёЁ])\s+([а-яА-ЯёЁ])/g, '$1$2');
+      
+      return text.slice(0, maxChars);
     }
 
     if (ext === ".docx") {
+      // Используем mammoth для извлечения текста
       const result = await mammoth.extractRawText({ path: filePath });
-      return (result.value ?? "").slice(0, maxChars);
+      let text = result.value ?? "";
+      
+      // Проверяем, что текст в правильной кодировке
+      const hasRussianLetters = /[а-яА-ЯёЁ]/.test(text);
+      // Символы, которые появляются при неправильной кодировке UTF-8 -> Windows-1251
+      const hasMojibake = /[╧|╨|╚|√|─|┐|╘|╤|╥|╦|╩|╪|ф|ю|є|√|ш|щ|х|ъ|ї|°|№|■|∙|┐|╚|╨|╧|╬|╡|╢|╖|╕|╣|║|╗|╝|╜|╛|┐|└|┴|┬|├|─|┼|╞|╟|╠|╡|╢|╖|╕|╣|║|╗|╝|╜|╛|┘]/.test(text);
+      
+      if (!hasRussianLetters || hasMojibake) {
+        console.warn("[rag] DOCX text has encoding issues, trying to fix...");
+        // Пробуем исправить кодировку - интерпретируем как UTF-8 байты, прочитанные как Windows-1251
+        try {
+          // Кодируем текст обратно в байты используя Windows-1251, затем декодируем как UTF-8
+          const encoder = new TextEncoder();
+          // Сначала получаем байты в Windows-1251 кодировке
+          const bytes = encoder.encode(text);
+          
+          // Пробуем декодировать как UTF-8
+          const decoder = new TextDecoder('utf8');
+          const decoded = decoder.decode(bytes);
+          
+          if (/[а-яА-ЯёЁ]/.test(decoded) && decoded.length > 0) {
+            return decoded.slice(0, maxChars);
+          }
+        } catch (e) {
+          console.warn("[rag] Failed to fix encoding:", e);
+        }
+        
+        // Если не удалось исправить, пробуем прочитать файл напрямую
+        try {
+          const buffer = fs.readFileSync(filePath);
+          const decoder = new TextDecoder('utf8');
+          const directText = decoder.decode(buffer);
+          
+          if (/[а-яА-ЯёЁ]/.test(directText) && !hasMojibake) {
+            return directText.slice(0, maxChars);
+          }
+        } catch {
+          // Игнорируем ошибки
+        }
+      }
+      
+      return text.slice(0, maxChars);
     }
 
     // .doc бинарный формат не поддерживаем надёжно без внешних утилит.
@@ -136,6 +192,22 @@ async function extractTextFromFile(filePath: string, _mimeType: string): Promise
     });
     return "";
   }
+}
+
+/**
+ * Создает tsvector для полнотекстового поиска
+ * Использует русскую конфигурацию для стемминга
+ */
+function createTextSearchVector(text: string): string {
+  // Очищаем текст от специальных символов и приводим к нижнему регистру
+  const cleaned = text
+    .toLowerCase()
+    .replace(/[.,;:!?()""''\-–—]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  
+  // Возвращаем текст в формате для pgvector (будет обработан PostgreSQL)
+  return cleaned;
 }
 
 async function rebuildDocumentChunks(
@@ -151,25 +223,34 @@ async function rebuildDocumentChunks(
 }> {
   await db.delete(ragDocumentChunksTable).where(eq(ragDocumentChunksTable.documentId, documentId));
 
-  const rawChunks = chunkText(content, { chunkSize: 1200, overlap: 250 });
+  // Используем улучшенную функцию с метаданными
+  const rawChunks = chunkTextWithMetadata(content, { chunkSize: 1200, overlap: 250 });
   const maxChunks = getMaxChunks();
   const chunks = rawChunks.slice(0, maxChunks);
   let insertedChunks = 0;
   const providers: Record<EmbeddingProvider, number> = {
-    ollama: 0,
     yandex: 0,
-    hf: 0,
     deterministic: 0,
   };
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     try {
-      const { embedding, provider } = await generateEmbeddingDetailed(chunk);
+      const { embedding, provider } = await generateEmbeddingDetailed(chunk.text);
+      
+      // Создаем tsvector для полнотекстового поиска
+      const textSearchVector = createTextSearchVector(chunk.text);
+      
+      // Номер пункта: сохраняем полный список через запятую (для точного поиска и цитирования)
+      const pointNumber = chunk.pointNumber?.trim() || null;
+
       await db.insert(ragDocumentChunksTable).values({
         documentId,
         chunkIndex: i,
-        chunkText: chunk,
+        chunkText: chunk.text,
+        chunkTextSearch: textSearchVector,
+        pointNumber: pointNumber,
+        sectionTitle: chunk.sectionTitle || null,
         embedding,
         isActive: true,
       });
@@ -200,6 +281,8 @@ router.get("/admin/rag-documents", requireAuth, requireRole("admin"), async (req
             documentId: ragDocumentChunksTable.documentId,
             chunkIndex: ragDocumentChunksTable.chunkIndex,
             chunkText: ragDocumentChunksTable.chunkText,
+            pointNumber: ragDocumentChunksTable.pointNumber,
+            sectionTitle: ragDocumentChunksTable.sectionTitle,
           })
           .from(ragDocumentChunksTable)
           .where(inArray(ragDocumentChunksTable.documentId, docIds))
@@ -264,7 +347,7 @@ router.post("/admin/rag-documents/upload", requireAuth, requireRole("admin"), up
       return;
     }
 
-    const chunks = chunkText(content, { chunkSize: 1200, overlap: 250 }).slice(0, getMaxChunks());
+    const chunks = chunkTextWithMetadata(content, { chunkSize: 1200, overlap: 250 });
     if (chunks.length === 0) {
       res.status(400).json({ error: "После обработки документ не содержит пригодных фрагментов для RAG" });
       return;
@@ -311,7 +394,7 @@ router.post("/admin/rag-documents/upload", requireAuth, requireRole("admin"), up
 // Обновить содержимое документа вручную
 router.put("/admin/rag-documents/:id/content", requireAuth, requireRole("admin"), async (req, res) => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
     const { content, title, description, isActive } = req.body;
 
     const updates: any = {};
@@ -400,7 +483,7 @@ router.post("/admin/rag-documents/reindex", requireAuth, requireRole("admin"), a
 // Удалить документ (только admin)
 router.delete("/admin/rag-documents/:id", requireAuth, requireRole("admin"), async (req, res) => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
 
     const [doc] = await db.select().from(ragDocumentsTable).where(eq(ragDocumentsTable.id, id)).limit(1);
     if (!doc) {
@@ -427,7 +510,8 @@ router.delete("/admin/rag-documents/:id", requireAuth, requireRole("admin"), asy
 
 // Скачать файл документа
 router.get("/admin/rag-documents/file/:filename", requireAuth, requireRole("admin"), (req, res) => {
-  const filePath = path.join(ragUploadDir, req.params.filename);
+  const filename = String(req.params.filename);
+  const filePath = path.join(ragUploadDir, filename);
   if (!fs.existsSync(filePath)) {
     res.status(404).json({ error: "Файл не найден" });
     return;

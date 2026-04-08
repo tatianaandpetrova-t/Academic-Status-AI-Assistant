@@ -1,49 +1,225 @@
 import { Router, type IRouter } from "express";
 import { db } from "@workspace/db";
 import { chatMessagesTable, applicationsTable, ragDocumentsTable, ragDocumentChunksTable } from "@workspace/db/schema";
-import { cosineDistance, desc, eq, sql } from "drizzle-orm";
+import { cosineDistance, desc, asc, eq, sql, like, or, and } from "drizzle-orm";
 import { requireAuth, requireRole } from "../middlewares/auth.js";
 import { generateChatCompletionDetailed } from "../lib/llm";
 import { generateEmbedding } from "../lib/embeddings";
 
 const router: IRouter = Router();
 
-// Базовый системный промпт для ИИ-ассистента
-const BASE_SYSTEM_PROMPT = `Ты — ИИ-ассистент Университета ИТМО, специализирующийся на вопросах получения учёных званий (доцент, профессор).
-
-Ты помогаешь преподавателям разобраться в:
-1. Критериях и требованиях для получения учёного звания согласно Постановлению Правительства РФ от 20.10.2023 №1746 (ред. от 17.02.2026) "О порядке присвоения ученых званий"
-2. Процедуре подачи заявки в ИТМО
-3. Трактовке понятий "педагогический стаж", "научно-педагогический стаж", публикации и т.д.
-4. Требуемых документах
-5. Особенностях процедуры в ИТМО
+// Базовый системный промпт: факты — из RAG; в ответе пользователю без технических идентификаторов
+const BASE_SYSTEM_PROMPT = `Ты — ИИ-ассистент Университета ИТМО. Помогаешь с вопросами по нормативным документам и процедурам, связанным с учёными званиями, опираясь на фрагменты, которые система передаёт ниже.
 
 Правила:
-- Отвечай чётко, структурированно, используй markdown форматирование (заголовки ##, списки -, жирный **текст**)
-- Ссылайся на нормативные документы когда это уместно
-- Если вопрос выходит за рамки компетенции — скажи об этом
-- Не давай юридических советов, только информационную помощь
+- Отвечай чётко и структурированно, используй markdown (заголовки ##, списки, **выделение**).
+- При ссылке на документ в ответе пользователю используй только человекочитаемое название из пометки контекста («…») и при необходимости номер пункта/раздела из текста. Не указывай documentId, chunkIndex, chunk, внутренние коды и не копируй служебные строки с «---».
+- Не выдумывай номера пунктов и цитаты, которых нет во фрагменте.
+- Если в фрагментах нет ответа — скажи об этом явно.
+- Когда просят дословную цитату — воспроизводи текст из фрагмента полностью, с нумерацией пункта и подпунктов (а), б), …), как в источнике.
+- Не давай юридических заключений; только информационная помощь.`;
 
-Основные критерии (Постановление Правительства РФ №1746):
+function humanizeRagSlug(s: string): string {
+  return s.replace(/_/g, " ").replace(/\s+/g, " ").trim();
+}
 
-**ДОЦЕНТ:**
-- Стаж научно-педагогической работы: ≥ 5 лет
-- Стаж педагогической работы по специальности: ≥ 3 лет
-- Публикации в рецензируемых изданиях: ≥ 10 за последние 5 лет
-- Учебные издания: ≥ 2 за 3 года
-- Публикации в Scopus/WoS: ≥ 2
-- Учёная степень: кандидат наук
+/** Пытается взять официальный заголовок из начала текста документа */
+function extractOfficialTitleFromContent(text: string): string | null {
+  const head = text.slice(0, 12_000);
+  const lines = head
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  for (let i = 0; i < Math.min(lines.length, 45); i++) {
+    const line = lines[i];
+    if (line.length < 12 || line.length > 520) continue;
+    if (/постановлени[ея]/i.test(line) && /правительств/i.test(line)) {
+      const next = lines[i + 1];
+      if (next && next.length < 140 && /(Российской|РФ|от\s+\d|№)/i.test(next)) {
+        return `${line} ${next}`.replace(/\s+/g, " ").trim();
+      }
+      return line;
+    }
+    if (/^(ПРИКАЗ|РАСПОРЯЖЕНИЕ|УКАЗ|ФЕДЕРАЛЬНЫЙ\s+ЗАКОН)\b/i.test(line) && line.length < 420) {
+      return line;
+    }
+  }
+  for (const line of lines.slice(0, 18)) {
+    if (line.length < 22 || line.length > 360) continue;
+    const upper = (line.match(/[А-ЯЁ]/g) || []).length;
+    const lower = (line.match(/[а-яё]/g) || []).length;
+    if (upper > 0 && upper > lower * 2 && /[А-ЯЁ]{12,}/.test(line)) return line;
+  }
+  return null;
+}
 
-**ПРОФЕССОР:**
-- Стаж научно-педагогической работы: ≥ 10 лет
-- Стаж педагогической работы по специальности: ≥ 5 лет
-- Публикации в рецензируемых изданиях: ≥ 20 за последние 5 лет
-- Учебные издания: ≥ 3 за 5 лет
-- Публикации в Scopus/WoS: ≥ 5
-- Учёная степень: доктор наук
-- Подготовка аспирантов: ≥ 1 защитившегося`;
+function ragDocumentDisplayTitle(d: {
+  title: string;
+  fileName: string;
+  content: string | null | undefined;
+}): string {
+  const head = (d.content ?? "").slice(0, 12_000);
+  const fromDoc = head.trim().length > 0 ? extractOfficialTitleFromContent(head) : null;
+  if (fromDoc) return fromDoc.replace(/\s+/g, " ").trim();
 
-// Старое поведение (fallback): подмешиваем текст всех активных документов.
+  const title = (d.title ?? "").trim();
+  const fileBase = (d.fileName ?? "").replace(/\.(docx|pdf|txt|md)$/i, "").trim();
+  if (title.length > 0) return humanizeRagSlug(title);
+  return humanizeRagSlug(fileBase || "Документ");
+}
+
+async function loadActiveRagDisplayTitles(): Promise<Map<number, string>> {
+  const rows = await db
+    .select({
+      id: ragDocumentsTable.id,
+      title: ragDocumentsTable.title,
+      fileName: ragDocumentsTable.fileName,
+      contentHead: sql<string>`left(coalesce(${ragDocumentsTable.content}, ''), 12000)`,
+    })
+    .from(ragDocumentsTable)
+    .where(eq(ragDocumentsTable.isActive, true));
+
+  const map = new Map<number, string>();
+  for (const r of rows) {
+    map.set(r.id, ragDocumentDisplayTitle({ title: r.title, fileName: r.fileName, content: r.contentHead }));
+  }
+  return map;
+}
+
+/** Совпадение point_number: одно значение или список «1, 2, 3» / «1,2,3» (без regex) */
+function sqlPointNumberMatchesColumn(pointNumber: string) {
+  const p = pointNumber.replace(/\D/g, "");
+  if (!p) return sql`false`;
+  return sql`(
+    ${ragDocumentChunksTable.pointNumber} = ${p}
+    OR ${ragDocumentChunksTable.pointNumber} LIKE ${`${p}, %`}
+    OR ${ragDocumentChunksTable.pointNumber} LIKE ${`${p},%`}
+    OR ${ragDocumentChunksTable.pointNumber} LIKE ${`%, ${p}, %`}
+    OR ${ragDocumentChunksTable.pointNumber} LIKE ${`%,${p},%`}
+    OR ${ragDocumentChunksTable.pointNumber} LIKE ${`%, ${p}`}
+    OR ${ragDocumentChunksTable.pointNumber} LIKE ${`%,${p}`}
+  )`;
+}
+
+function chunkRowMatchesPoint(pointNumber: string | null | undefined, requestedPoint: string): boolean {
+  if (!pointNumber) return false;
+  return pointNumber
+    .split(",")
+    .map((p) => p.trim())
+    .includes(requestedPoint);
+}
+
+function mergeChunkTextsForPoint(
+  rows: Array<{ chunkText: string; chunkIndex: number }>,
+  requestedPoint: string,
+): string {
+  const esc = requestedPoint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const headerRe = new RegExp(`^\\s*${esc}[\\.\\)]\\s`);
+  const sorted = [...rows].sort((a, b) => a.chunkIndex - b.chunkIndex);
+  const out: string[] = [];
+  let seenHeader = false;
+  for (const row of sorted) {
+    const lines = row.chunkText.split("\n");
+    let start = 0;
+    if (seenHeader && lines[0] !== undefined && headerRe.test(lines[0])) {
+      start = 1;
+    }
+    for (let i = start; i < lines.length; i++) {
+      if (headerRe.test(lines[i])) seenHeader = true;
+      out.push(lines[i]);
+    }
+  }
+  return out.join("\n");
+}
+
+/** Вырезает один верхнеуровневый пункт от заголовка «N.» до следующего «M.» */
+function sliceSinglePointBlock(merged: string, requestedPoint: string): string | null {
+  const lines = merged.split("\n");
+  const esc = requestedPoint.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const headerRe = new RegExp(`^\\s*${esc}[\\.\\)]\\s`);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (headerRe.test(lines[i])) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  const body: string[] = [];
+  for (let i = start; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (i > start) {
+      const m = trimmed.match(/^(\d{1,3})[\.\)]\s/);
+      if (m && m[1] !== requestedPoint) break;
+    }
+    body.push(lines[i]);
+  }
+  const text = body.join("\n").trim();
+  return text.length > 0 ? text : null;
+}
+
+async function tryExtractFullPointFromRag(
+  sortedChunks: Array<{
+    documentId: number;
+    documentTitle: string;
+    chunkIndex: number;
+    chunkText: string;
+    pointNumber: string | null;
+  }>,
+  point: string,
+  displayTitleByDocId: Map<number, string>,
+): Promise<{ content: string; displayTitle: string; point: string } | null> {
+  const anchor = sortedChunks.find((c) => chunkRowMatchesPoint(c.pointNumber, point));
+  if (!anchor) return null;
+
+  const rows = await db
+    .select({
+      chunkIndex: ragDocumentChunksTable.chunkIndex,
+      chunkText: ragDocumentChunksTable.chunkText,
+      pointNumber: ragDocumentChunksTable.pointNumber,
+    })
+    .from(ragDocumentChunksTable)
+    .where(
+      and(eq(ragDocumentChunksTable.documentId, anchor.documentId), sqlPointNumberMatchesColumn(point)),
+    )
+    .orderBy(asc(ragDocumentChunksTable.chunkIndex));
+
+  const filtered = rows.filter((r) => chunkRowMatchesPoint(r.pointNumber, point));
+  const merged = mergeChunkTextsForPoint(filtered, point);
+  let sliced = sliceSinglePointBlock(merged, point);
+  if (!sliced && filtered.length === 0) {
+    const fromSearch = sortedChunks
+      .filter(
+        (c) => c.documentId === anchor.documentId && chunkRowMatchesPoint(c.pointNumber, point),
+      )
+      .map((c) => ({ chunkText: c.chunkText, chunkIndex: c.chunkIndex }));
+    const m2 = mergeChunkTextsForPoint(fromSearch, point);
+    sliced = sliceSinglePointBlock(m2, point);
+  }
+  if (!sliced) return null;
+
+  const displayTitle =
+    displayTitleByDocId.get(anchor.documentId) ?? humanizeRagSlug(anchor.documentTitle);
+  return { content: sliced, displayTitle, point };
+}
+
+function formatExactPointQuoteForLlm(displayTitle: string, point: string, content: string): string {
+  return `--- Дословная цитата пункта ${point}. Для пользователя укажи источник так: «${displayTitle}», пункт ${point}. Не пиши documentId, chunk, внутренние коды. ---\n${content}`;
+}
+
+function formatRagFragmentForLlm(
+  displayTitle: string,
+  body: string,
+  meta?: { pointNumbers?: string | null; sectionTitle?: string | null },
+): string {
+  const bits: string[] = [];
+  if (meta?.pointNumbers) bits.push(`фрагмент охватывает пункты: ${meta.pointNumbers}`);
+  if (meta?.sectionTitle) bits.push(`раздел: ${meta.sectionTitle}`);
+  const extra = bits.length ? ` ${bits.join("; ")}.` : "";
+  return `--- Фрагмент документа.${extra} В ответе пользователю укажи источник: «${displayTitle}». Не пиши documentId, chunkIndex, chunk. ---\n${body}`;
+}
+
+// Fallback: подмешиваем текст всех активных документов
 async function buildSystemPromptFallback(): Promise<string> {
   try {
     const ragDocs = await db.select()
@@ -56,10 +232,18 @@ async function buildSystemPromptFallback(): Promise<string> {
       return BASE_SYSTEM_PROMPT;
     }
 
-    // Добавляем контент нормативных документов в промпт
-    const ragContext = docsWithContent.map(d =>
-      `--- ДОКУМЕНТ: ${d.title} ---\n${d.content!.slice(0, 8000)}\n---`
-    ).join("\n\n");
+    const ragContext = docsWithContent
+      .map((d) =>
+        formatRagFragmentForLlm(
+          ragDocumentDisplayTitle({
+            title: d.title,
+            fileName: d.fileName,
+            content: d.content,
+          }),
+          d.content!.slice(0, 8000),
+        ),
+      )
+      .join("\n\n");
 
     return `${BASE_SYSTEM_PROMPT}
 
@@ -74,44 +258,387 @@ ${ragContext}
   }
 }
 
-async function buildSystemPromptWithVectorRag(userMessage: string): Promise<string> {
-  const topK = 12;
-  const similarityThreshold = 0.18;
+/**
+ * Полнотекстовый поиск с использованием триграммного индекса PostgreSQL
+ * Возвращает чанки, которые содержат ключевые слова из запроса
+ */
+async function fullTextSearchChunks(query: string, topK: number) {
+  // Извлекаем ключевые слова из запроса (минимум 2 символа для триграмм)
+  const keywords = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length >= 2)
+    .filter(w => /[а-яa-z]/i.test(w));
+
+  if (keywords.length === 0) return [];
+
+  // Используем нечеткий поиск с триграммами
+  // Ищем чанки, которые содержат хотя бы одно из ключевых слов
+  const conditions = keywords.map(keyword => 
+    like(ragDocumentChunksTable.chunkText, `%${keyword}%`)
+  );
+
+  const raw = await db
+    .select({
+      documentId: ragDocumentsTable.id,
+      documentTitle: ragDocumentsTable.title,
+      chunkIndex: ragDocumentChunksTable.chunkIndex,
+      chunkText: ragDocumentChunksTable.chunkText,
+      pointNumber: ragDocumentChunksTable.pointNumber,
+      sectionTitle: ragDocumentChunksTable.sectionTitle,
+    })
+    .from(ragDocumentChunksTable)
+    .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
+    .where(and(
+      eq(ragDocumentsTable.isActive, true),
+      or(...conditions)
+    ))
+    .limit(topK * 10);
+
+  return raw;
+}
+
+/**
+ * Поиск по метаданным (номер пункта, заголовок раздела)
+ */
+async function searchByMetadata(query: string, topK: number) {
+  // Извлекаем номер пункта из запроса
+  const pointMatch = query.match(/(?:пункт|п\.?\s*|статья\s*|§\s*)(\d{1,3})/i);
+  const pointNumber = pointMatch ? pointMatch[1] : null;
+
+  // Извлекаем ключевые слова для поиска по разделам
+  const sectionKeywords = query
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length >= 3)
+    .filter(w => /[а-я]/i.test(w));
+
+  // Ищем упоминания разделов в запросе (V, VI, VII и т.д.)
+  const romanSectionMatch = query.match(/\b([IVXLCDM]+)\.\s*(?:раздел|глава|пункт)?/i);
+  const sectionNameMatch = query.match(/раздел\s+([IVXLCDM]+)\.?/i);
+  const romanRaw = romanSectionMatch?.[1] ?? sectionNameMatch?.[1];
+  const romanNumeral = romanRaw ? romanRaw.toUpperCase() : null;
+
+  const conditions: any[] = [eq(ragDocumentsTable.isActive, true)];
+
+  if (pointNumber) {
+    conditions.push(sqlPointNumberMatchesColumn(pointNumber));
+  }
+
+  // Ищем по ключевым словам в заголовке раздела ИЛИ в тексте чанка
+  // Используем OR вместо AND для более широкого поиска
+  if (sectionKeywords.length > 0) {
+    const sectionConditions: any[] = [];
+
+    // Ищем по ключевым словам в заголовке раздела
+    for (const keyword of sectionKeywords.slice(0, 5)) {
+      sectionConditions.push(like(ragDocumentChunksTable.sectionTitle, `%${keyword}%`));
+    }
+
+    for (const keyword of sectionKeywords.slice(0, 3)) {
+      sectionConditions.push(like(ragDocumentChunksTable.chunkText, `%${keyword}%`));
+    }
+
+    if (sectionConditions.length > 0) {
+      conditions.push(or(...sectionConditions));
+    }
+  }
+
+  if (romanNumeral) {
+    conditions.push(
+      or(
+        like(ragDocumentChunksTable.sectionTitle, `%${romanNumeral}.%`),
+        like(ragDocumentChunksTable.chunkText, `%${romanNumeral}.%`),
+        like(ragDocumentChunksTable.sectionTitle, `%раздел ${romanNumeral}%`),
+        like(ragDocumentChunksTable.chunkText, `%раздел ${romanNumeral}%`),
+        like(ragDocumentChunksTable.sectionTitle, `%глава ${romanNumeral}%`),
+        like(ragDocumentChunksTable.chunkText, `%глава ${romanNumeral}%`),
+      ),
+    );
+  }
+
+  if (conditions.length <= 1) return [];
 
   try {
-    const chunks = await selectRagChunks(userMessage, topK * 3);
+    const raw = await db
+      .select({
+        documentId: ragDocumentsTable.id,
+        documentTitle: ragDocumentsTable.title,
+        chunkIndex: ragDocumentChunksTable.chunkIndex,
+        chunkText: ragDocumentChunksTable.chunkText,
+        pointNumber: ragDocumentChunksTable.pointNumber,
+        sectionTitle: ragDocumentChunksTable.sectionTitle,
+      })
+      .from(ragDocumentChunksTable)
+      .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
+      .where(and(...conditions))
+      .limit(topK * 5);
 
-    const validChunks = chunks
-      .map((c) => c.chunkText)
-      .filter((t) => !!t && t.trim().length > 0);
+    return raw;
+  } catch {
+    return [];
+  }
+}
 
-    if (validChunks.length === 0) return buildSystemPromptFallback();
+async function buildSystemPromptWithVectorRag(userMessage: string): Promise<string> {
+  const topK = 12;
+  const similarityThreshold = 0.15;
+  const quoteMode = isQuoteRequest(userMessage);
+  const requestedPoints = extractRequestedPoints(userMessage);
 
-    const ragContext = chunks
-      .filter((c) => c.score >= similarityThreshold)
-      .slice(0, topK)
-      .map(
-        (c, idx) =>
-          `[SOURCE_${idx + 1}] ДОКУМЕНТ: ${c.documentTitle}; ФРАГМЕНТ: ${c.chunkIndex}; SCORE: ${c.score.toFixed(3)}; KEYWORD: ${c.keywordScore.toFixed(3)}; SEMANTIC: ${c.semanticScore.toFixed(3)}\n${c.chunkText.slice(0, 2200)}`,
-      )
+  try {
+    const displayTitleByDocId = await loadActiveRagDisplayTitles();
+
+    // 1. Сначала пытаемся найти по метаданным (номер пункта, раздел)
+    const metadataChunks = await searchByMetadata(userMessage, topK);
+    
+    // 2. Полнотекстовый поиск по ключевым словам
+    const fullTextChunks = await fullTextSearchChunks(userMessage, topK);
+    
+    // 3. Семантический поиск через векторы
+    let semanticChunks: Array<{
+      documentId: number;
+      documentTitle: string;
+      chunkIndex: number;
+      chunkText: string;
+      pointNumber: string | null;
+      sectionTitle: string | null;
+      similarity: number;
+    }> = [];
+
+    try {
+      const queryEmbedding = await generateEmbedding(userMessage);
+      const similarity = sql<number>`1 - (${cosineDistance(ragDocumentChunksTable.embedding, queryEmbedding)})`;
+
+      semanticChunks = await db
+        .select({
+          documentId: ragDocumentsTable.id,
+          documentTitle: ragDocumentsTable.title,
+          chunkIndex: ragDocumentChunksTable.chunkIndex,
+          chunkText: ragDocumentChunksTable.chunkText,
+          pointNumber: ragDocumentChunksTable.pointNumber,
+          sectionTitle: ragDocumentChunksTable.sectionTitle,
+          similarity,
+        })
+        .from(ragDocumentChunksTable)
+        .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
+        .where(eq(ragDocumentsTable.isActive, true))
+        .orderBy((t) => desc(t.similarity))
+        .limit(topK * 8);
+    } catch (e) {
+      console.warn("[chat] Semantic search failed:", e);
+      semanticChunks = [];
+    }
+
+    // Объединяем все чанки
+    const allChunks = new Map<string, {
+      documentId: number;
+      documentTitle: string;
+      chunkIndex: number;
+      chunkText: string;
+      pointNumber: string | null;
+      sectionTitle: string | null;
+      score: number;
+    }>();
+
+    // Добавляем чанки из метаданных
+    for (const c of metadataChunks) {
+      const key = `${c.documentId}:${c.chunkIndex}`;
+      const score = keywordScore(c.chunkText, userMessage) + (c.pointNumber ? 0.3 : 0);
+      allChunks.set(key, {
+        ...c,
+        pointNumber: c.pointNumber,
+        sectionTitle: c.sectionTitle,
+        score,
+      });
+    }
+
+    // Добавляем чанки из полнотекстового поиска
+    for (const c of fullTextChunks) {
+      const key = `${c.documentId}:${c.chunkIndex}`;
+      const score = keywordScore(c.chunkText, userMessage);
+      const existing = allChunks.get(key);
+      if (!existing || score > existing.score) {
+        allChunks.set(key, {
+          ...c,
+          pointNumber: c.pointNumber,
+          sectionTitle: c.sectionTitle,
+          score,
+        });
+      }
+    }
+
+    // Добавляем чанки из семантического поиска
+    for (const c of semanticChunks) {
+      const key = `${c.documentId}:${c.chunkIndex}`;
+      const sim = Number(c.similarity);
+      const score = sim * 0.7 + keywordScore(c.chunkText, userMessage) * 0.3;
+      const existing = allChunks.get(key);
+      if (!existing || score > existing.score) {
+        allChunks.set(key, {
+          ...c,
+          pointNumber: c.pointNumber,
+          sectionTitle: c.sectionTitle,
+          score,
+        });
+      }
+    }
+
+    let sortedChunks = Array.from(allChunks.values())
+      .filter(c => c.chunkText && c.chunkText.trim().length > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (requestedPoints.length > 0) {
+      let exactHit: { content: string; displayTitle: string; point: string } | null = null;
+
+      for (const point of requestedPoints) {
+        const hit = await tryExtractFullPointFromRag(sortedChunks, point, displayTitleByDocId);
+        if (hit) {
+          exactHit = hit;
+          break;
+        }
+      }
+
+      // Если нашли точное содержимое - используем только его
+      if (exactHit) {
+        const ragContext = formatExactPointQuoteForLlm(
+          exactHit.displayTitle,
+          exactHit.point,
+          exactHit.content,
+        );
+
+        const quoteInstructions = quoteMode
+          ? `
+КРИТИЧЕСКИ ВАЖНО ДЛЯ ЦИТИРОВАНИЯ:
+- Пользователь запросил пункт ${requestedPoints.join(", ")} — приоритетная задача
+- Ниже полный текст пункта из документа (все подпункты а), б), …). Воспроизведи ДОСЛОВНО, с первой строки «N.» включительно
+- В ответе пользователю укажи только: «${exactHit.displayTitle}», пункт ${exactHit.point} — без технических идентификаторов и без строк «---»
+- Не добавляй сведения из других пунктов`
+          : `
+КРИТИЧЕСКИ ВАЖНО:
+- Выше полный текст запрошенного пункта; используй только его
+- В ответе пользователю укажи источник: «${exactHit.displayTitle}», пункт ${exactHit.point}
+- Не смешивай с другими пунктами`;
+
+        return `${BASE_SYSTEM_PROMPT}
+
+---
+ЗАГРУЖЕННЫЕ НОРМАТИВНЫЕ ДОКУМЕНТЫ (приоритетный источник информации):
+
+${ragContext}
+${quoteInstructions}`;
+      }
+      
+      // Если точного содержимого нет - фильтруем чанки, оставляя только те, что содержат запрошенный пункт
+      sortedChunks = sortedChunks.filter(c => {
+        if (!c.pointNumber) return false;
+        const pointNumbers = c.pointNumber.split(',').map(p => p.trim());
+        return requestedPoints.some(rp => pointNumbers.includes(rp));
+      });
+    }
+
+    if (sortedChunks.length === 0) {
+      return buildSystemPromptWithFullDocumentFallback(userMessage);
+    }
+
+    // Собираем контекст из отфильтрованных чанков
+    const ragContext = sortedChunks
+      .slice(0, 5)
+      .map((c) => {
+        const displayTitle =
+          displayTitleByDocId.get(c.documentId) ?? humanizeRagSlug(c.documentTitle);
+        return formatRagFragmentForLlm(displayTitle, c.chunkText.slice(0, 3000), {
+          pointNumbers: c.pointNumber,
+          sectionTitle: c.sectionTitle,
+        });
+      })
       .join("\n\n");
 
-    if (!ragContext.trim()) return buildSystemPromptFallback();
+    const quoteInstructions = quoteMode && requestedPoints.length > 0
+      ? `
+КРИТИЧЕСКИ ВАЖНО ДЛЯ ЦИТИРОВАНИЯ:
+- Пользователь запросил пункт ${requestedPoints.join(", ")}
+- Найди в фрагментах полный текст пункта (от строки «N.» до следующего пункта) и воспроизведи ДОСЛОВНО, со всеми подпунктами
+- В ответе пользователю укажи только название документа из пометки «…» и номер пункта — без documentId/chunk
+- Не добавляй информацию из других фрагментов без отдельной ссылки`
+      : `
+КРИТИЧЕСКИ ВАЖНО:
+- СНАЧАЛА используй факты из приведённых фрагментов документов
+- Если точного ответа нет в предоставленных фрагментах — скажи "В предоставленных документах нет информации по этому вопросу"
+- Цитируй дословно там, где это важно; не выдумывай номера пунктов
+- Для пользователя указывай источник только как «название из пометки», при необходимости пункт/раздел из текста`;
 
     return `${BASE_SYSTEM_PROMPT}
 
 ---
-ДОПОЛНИТЕЛЬНЫЕ НОРМАТИВНЫЕ ДОКУМЕНТЫ ИТМО (по релевантности):
+ЗАГРУЖЕННЫЕ НОРМАТИВНЫЕ ДОКУМЕНТЫ (приоритетный источник информации):
+
+${ragContext}
+${quoteInstructions}`;
+  } catch (err) {
+    console.error("[chat] RAG error:", err);
+    return buildSystemPromptWithFullDocumentFallback(userMessage);
+  }
+}
+
+/**
+ * Fallback: если поиск по чанкам не дал результатов, ищем по полному тексту документов
+ */
+async function buildSystemPromptWithFullDocumentFallback(userMessage: string): Promise<string> {
+  try {
+    const keywords = userMessage
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(w => w.length >= 3)
+      .filter(w => /[а-яa-z]/i.test(w));
+
+    if (keywords.length === 0) {
+      return buildSystemPromptFallback();
+    }
+
+    // Ищем документы, в тексте которых есть ключевые слова
+    const conditions = keywords.map(keyword => 
+      like(ragDocumentsTable.content, `%${keyword}%`)
+    );
+
+    const docs = await db
+      .select({
+        title: ragDocumentsTable.title,
+        fileName: ragDocumentsTable.fileName,
+        content: ragDocumentsTable.content,
+      })
+      .from(ragDocumentsTable)
+      .where(and(
+        eq(ragDocumentsTable.isActive, true),
+        or(...conditions)
+      ))
+      .limit(3);
+
+    if (docs.length === 0) {
+      return buildSystemPromptFallback();
+    }
+
+    const ragContext = docs
+      .map((d) =>
+        formatRagFragmentForLlm(
+          ragDocumentDisplayTitle({
+            title: d.title,
+            fileName: d.fileName,
+            content: d.content,
+          }),
+          d.content!.slice(0, 10000),
+        ),
+      )
+      .join("\n\n");
+
+    return `${BASE_SYSTEM_PROMPT}
+
+---
+НАЙДЕНЫ ДОКУМЕНТЫ ПО ПОЛНОМУ ТЕКСТУ:
 
 ${ragContext}
 
-КРИТИЧЕСКИ ВАЖНО:
-- СНАЧАЛА используй факты из приведённых фрагментов документов (они приоритетнее любых общих знаний)
-- Если точного ответа нет в предоставленных фрагментах — скажи "В предоставленных документах нет информации по этому вопросу"
-- ЦИТИРУЙ дословно текст документа, не выдумывай и не обобщай
-- Если просит процитировать конкретный пункт — найди и приведи ТОЧНУЮ цитату из документа
-- В конце каждого содержательного утверждения ставь ссылку на источник в формате [SOURCE_N]
-- Не используй общие знания или предположения`;
+При ответах используй информацию из этих документов. Ищи конкретные пункты и разделы, соответствующие вопросу.`;
   } catch {
     return buildSystemPromptFallback();
   }
@@ -121,31 +648,91 @@ function normalizeTokenForSearch(token: string): string {
   return token.toLowerCase().replace(/[^a-zа-яё0-9]/gi, "");
 }
 
+/**
+ * Извлекает номера пунктов из запроса пользователя
+ * Поддерживает форматы: "пункт 22", "п.22", "п 22", "22", "статья 5", "§1"
+ */
 function extractRequestedPoints(query: string): string[] {
-  const matches = query.match(/(?:пункт|п\.?)\s*(\d{1,3})/gi) ?? [];
-  return matches
-    .map((m) => m.match(/(\d{1,3})/)?.[1] ?? "")
-    .filter(Boolean);
+  const pattern = /(?:пункт\s+|п\.?\s*|статья\s+|§\s*)(\d{1,3})/gi;
+  const matches: string[] = [];
+  let match;
+  while ((match = pattern.exec(query)) !== null) {
+    if (match[1]) matches.push(match[1]);
+  }
+  // Если нет явных маркеров, ищем просто числа (для "что сказано в 22 пункте")
+  if (matches.length === 0) {
+    const numPattern = /\b(\d{1,3})\b/g;
+    while ((match = numPattern.exec(query)) !== null) {
+      const num = match[1];
+      if (num && !/^(19|20)\d{2}$/.test(num)) {
+        matches.push(num);
+      }
+    }
+  }
+  return [...new Set(matches)];
 }
 
+/**
+ * Проверяет, запрашивает ли пользователь цитату или конкретный пункт
+ */
+function isQuoteRequest(query: string): boolean {
+  const quotePatterns = [
+    /процитируй/i,
+    /цитат/i,
+    /дословн/i,
+    /точн/i,
+    /что сказано/i,
+    /гласит/i,
+    /сказано/i,
+    /какие\s+пункты/i,
+    /какие\s+положения/i,
+  ];
+  return quotePatterns.some(p => p.test(query));
+}
+
+/**
+ * Вычисляет score за соответствие номера пункта
+ * Возвращает значение от 0 до 1
+ */
 function pointScore(text: string, query: string): number {
   const points = extractRequestedPoints(query);
   if (points.length === 0) return 0;
+  
   const textLc = text.toLowerCase();
-  let hit = 0;
+  let totalHit = 0;
+  
   for (const p of points) {
+    let hit = 0;
+    
+    // Проверяем различные форматы записи пунктов
     const patterns = [
-      `пункт ${p}`,
-      `п. ${p}`,
-      `п.${p}`,
-      `${p}.`,
-      `(${p})`,
+      new RegExp(`пункт\\s+${p}[\\s\\.\\),]`, 'i'),
+      new RegExp(`п\\.\\s*${p}[\\s\\.\\),]`, 'i'),
+      new RegExp(`п\\s+${p}[\\s\\.\\),]`, 'i'),
+      new RegExp(`^${p}\\.\\s`, 'm'),
+      new RegExp(`^${p}\\)`, 'm'),
+      new RegExp(`\\(${p}\\)`),
+      new RegExp(`статья\\s+${p}[\\s\\.\\),]`, 'i'),
+      new RegExp(`§\\s*${p}[\\s\\.\\),]`, 'i'),
     ];
-    if (patterns.some((pt) => textLc.includes(pt))) hit += 1;
+    
+    for (const pattern of patterns) {
+      if (pattern.test(textLc)) {
+        hit = 1;
+        break;
+      }
+    }
+    
+    totalHit += hit;
   }
-  return hit / points.length;
+  
+  return totalHit / points.length;
 }
 
+/**
+ * Улучшенная функция подсчета keyword score
+ * Учитывает морфологию русского языка (базовая)
+ */
 function keywordScore(text: string, query: string): number {
   const textLc = text.toLowerCase();
   const queryTokens = Array.from(
@@ -153,116 +740,42 @@ function keywordScore(text: string, query: string): number {
       query
         .split(/\s+/)
         .map((t) => normalizeTokenForSearch(t))
-        .filter((t) => t.length >= 3),
+        .filter((t) => t.length >= 2),  // Уменьшили порог с 3 до 2
     ),
   );
   if (queryTokens.length === 0) return 0;
 
   let score = 0;
+  let matched = 0;
+  
   for (const token of queryTokens) {
-    if (textLc.includes(token)) score += 1;
+    // Прямое вхождение
+    if (textLc.includes(token)) {
+      matched += 1;
+      continue;
+    }
+    
+    // Проверяем вхождение без окончания (упрощенный стемминг)
+    const stem = token.slice(0, -1);
+    if (stem.length >= 2 && textLc.includes(stem)) {
+      matched += 0.5;
+    }
   }
-  return score / queryTokens.length;
-}
-
-async function selectRagChunks(userMessage: string, topK = 12) {
-  const lexicalRaw = await db
-    .select({
-      documentId: ragDocumentsTable.id,
-      documentTitle: ragDocumentsTable.title,
-      chunkIndex: ragDocumentChunksTable.chunkIndex,
-      chunkText: ragDocumentChunksTable.chunkText,
-    })
-    .from(ragDocumentChunksTable)
-    .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
-    .where(eq(ragDocumentsTable.isActive, true))
-    .limit(Math.max(topK * 12, 200));
-
-  const lexicalScored = lexicalRaw
-    .map((c) => {
-      const kScore = keywordScore(c.chunkText, userMessage);
-      const pScore = pointScore(c.chunkText, userMessage);
-      const combinedKeyword = kScore * 0.75 + pScore * 0.25;
-      return {
-        ...c,
-        keywordScore: combinedKeyword,
-        semanticScore: 0,
-        similarity: 0,
-        score: combinedKeyword,
-      };
-    })
-    .filter((c) => c.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK * 4);
-
-  let semanticScored: Array<{
-    documentId: number;
-    documentTitle: string;
-    chunkIndex: number;
-    chunkText: string;
-    keywordScore: number;
-    semanticScore: number;
-    similarity: number;
-    score: number;
-  }> = [];
-
-  try {
-    const queryEmbedding = await generateEmbedding(userMessage);
-    const similarity = sql<number>`1 - (${cosineDistance(ragDocumentChunksTable.embedding, queryEmbedding)})`;
-
-    const semanticRaw = await db
-      .select({
-        documentId: ragDocumentsTable.id,
-        documentTitle: ragDocumentsTable.title,
-        chunkIndex: ragDocumentChunksTable.chunkIndex,
-        chunkText: ragDocumentChunksTable.chunkText,
-        similarity,
-      })
-      .from(ragDocumentChunksTable)
-      .innerJoin(ragDocumentsTable, eq(ragDocumentsTable.id, ragDocumentChunksTable.documentId))
-      .where(eq(ragDocumentsTable.isActive, true))
-      .orderBy((t) => desc(t.similarity))
-      .limit(topK * 8);
-
-    semanticScored = semanticRaw.map((c) => {
-      const sim = Number(c.similarity);
-      const kScore = keywordScore(c.chunkText, userMessage);
-      const pScore = pointScore(c.chunkText, userMessage);
-      const combinedKeyword = kScore * 0.7 + pScore * 0.3;
-      return {
-        ...c,
-        keywordScore: combinedKeyword,
-        semanticScore: sim,
-        score: sim * 0.75 + combinedKeyword * 0.25,
-      };
-    });
-  } catch {
-    // Важный fallback: RAG остаётся рабочим даже без embedding-провайдера.
-    semanticScored = [];
-  }
-
-  const merged = new Map<string, (typeof lexicalScored)[number]>();
-  for (const c of [...semanticScored, ...lexicalScored]) {
-    const key = `${c.documentId}:${c.chunkIndex}`;
-    const prev = merged.get(key);
-    if (!prev || c.score > prev.score) merged.set(key, c);
-  }
-
-  return Array.from(merged.values())
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
+  
+  return matched / queryTokens.length;
 }
 
 // История чата пользователя
 router.get("/chat/messages", requireAuth, async (req, res) => {
   try {
-    const { limit = "50" } = req.query;
+    const rawLimit = req.query.limit;
+    const limit = typeof rawLimit === 'string' ? parseInt(rawLimit) : 50;
 
     const messages = await db.select()
       .from(chatMessagesTable)
       .where(eq(chatMessagesTable.userId, req.userId!))
       .orderBy(desc(chatMessagesTable.createdAt))
-      .limit(parseInt(limit as string));
+      .limit(isNaN(limit) ? 50 : limit);
 
     res.json(messages.reverse().map(formatMessage));
   } catch (err) {
@@ -281,7 +794,7 @@ router.post("/chat/messages", requireAuth, async (req, res) => {
       return;
     }
 
-    // Строим системный промпт с pgvector-RAG
+    // Строим системный промпт с улучшенным RAG
     const systemPrompt = await buildSystemPromptWithVectorRag(message);
 
     // История последних сообщений для контекста
@@ -324,7 +837,7 @@ router.post("/chat/messages", requireAuth, async (req, res) => {
 
     chatMessages.push({ role: "user", content: message });
 
-    // Запрос к LLM (HF -> local Qwen fallback)
+    // Запрос к LLM
     const llm = await generateChatCompletionDetailed(chatMessages as any);
     const responseText = llm.text;
 
@@ -341,7 +854,16 @@ router.post("/chat/messages", requireAuth, async (req, res) => {
     if (debug === true && req.userRole === "admin") {
       let ragChunks: any[] = [];
       try {
-        ragChunks = await selectRagChunks(message, 4);
+        const metadataChunks = await searchByMetadata(message, 4);
+        const fullTextChunks = await fullTextSearchChunks(message, 4);
+        ragChunks = [...metadataChunks, ...fullTextChunks].slice(0, 4).map(c => ({
+          documentId: c.documentId,
+          documentTitle: c.documentTitle,
+          chunkIndex: c.chunkIndex,
+          pointNumber: c.pointNumber,
+          sectionTitle: c.sectionTitle,
+          preview: c.chunkText.slice(0, 220),
+        }));
       } catch {
         ragChunks = [];
       }
@@ -349,13 +871,7 @@ router.post("/chat/messages", requireAuth, async (req, res) => {
         provider: llm.diagnostics.provider,
         model: llm.diagnostics.model,
         latencyMs: llm.diagnostics.latencyMs,
-        ragChunks: ragChunks.map((c) => ({
-          documentId: c.documentId,
-          documentTitle: c.documentTitle,
-          chunkIndex: c.chunkIndex,
-          similarity: Number(c.similarity),
-          preview: c.chunkText.slice(0, 220),
-        })),
+        ragChunks,
       };
     }
 
@@ -376,16 +892,23 @@ router.post("/chat/rag-debug", requireAuth, requireRole("admin"), async (req, re
     }
 
     const limit = Math.min(Math.max(Number(topK) || 6, 1), 20);
-    const chunks = await selectRagChunks(message.trim(), limit);
+    
+    const metadataChunks = await searchByMetadata(message.trim(), limit);
+    const fullTextChunks = await fullTextSearchChunks(message.trim(), limit);
+    
+    const allChunks = [...metadataChunks, ...fullTextChunks].slice(0, limit);
 
     res.json({
       message: message.trim(),
       topK: limit,
-      chunks: chunks.map((c) => ({
+      metadataResults: metadataChunks.length,
+      fullTextResults: fullTextChunks.length,
+      chunks: allChunks.map((c) => ({
         documentId: c.documentId,
         documentTitle: c.documentTitle,
         chunkIndex: c.chunkIndex,
-        similarity: Number(c.similarity),
+        pointNumber: c.pointNumber,
+        sectionTitle: c.sectionTitle,
         chunkText: c.chunkText,
       })),
     });
@@ -398,7 +921,8 @@ router.post("/chat/rag-debug", requireAuth, requireRole("admin"), async (req, re
 // Оценить ответ ИИ (👍/👎)
 router.post("/chat/messages/:id/rate", requireAuth, async (req, res) => {
   try {
-    const id = parseInt(req.params.id);
+    const idParam = req.params.id;
+    const id = typeof idParam === 'string' ? parseInt(idParam) : parseInt(String(idParam));
     const { rating } = req.body;
 
     if (![1, -1].includes(rating)) {
